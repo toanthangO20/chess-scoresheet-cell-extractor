@@ -112,11 +112,19 @@ Save only cells that appear to contain handwriting:
 python extract_cells.py --non-empty-only
 ```
 
+The non-empty filter estimates the local paper background and keeps only pixels that
+look like darker ink strokes relative to that background. It also ignores long
+grid-line strokes so blank cells with only table borders or gray paper noise are not
+treated as handwritten content.
+
 Tune the handwriting filter:
 
 ```powershell
 python extract_cells.py --non-empty-only --min-dark-ratio 0.018
 ```
+
+Despite the option name, this now controls the minimum contrast-ink pixel ratio, not
+an absolute dark-pixel ratio.
 
 Trim the printed move-number column from White cells:
 
@@ -128,6 +136,19 @@ Use `0` to disable this trim:
 
 ```powershell
 python extract_cells.py --trim-number-column-ratio 0
+```
+
+By default, saved cells are cropped slightly inside the detected table borders so the
+top and bottom grid lines are removed:
+
+```powershell
+python extract_cells.py --cell-border-trim-ratio 0.10
+```
+
+Use `0` to keep the original cell borders:
+
+```powershell
+python extract_cells.py --cell-border-trim-ratio 0
 ```
 
 ## Troubleshooting

@@ -11,6 +11,8 @@ from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
 IMAGE_PATTERNS = ("*.png", "*.jpg", "*.jpeg")
+INK_CONTRAST_THRESHOLD = 20
+MIN_INK_COMPONENT_AREA = 6
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +40,10 @@ def parse_args() -> argparse.Namespace:
         "--min-dark-ratio",
         default=0.012,
         type=float,
-        help="Minimum dark-pixel ratio used by --non-empty-only.",
+        help=(
+            "Minimum contrast-ink pixel ratio used by --non-empty-only. "
+            "Higher values filter more aggressively."
+        ),
     )
     parser.add_argument(
         "--trim-number-column-ratio",
@@ -47,6 +52,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Fraction trimmed from the left side of White cells to remove the "
             "printed move-number column. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--cell-border-trim-ratio",
+        default=0.10,
+        type=float,
+        help=(
+            "Fraction trimmed from the top and bottom of each detected cell to "
+            "remove grid borders before saving/filtering. Use 0 to keep borders."
         ),
     )
     parser.add_argument(
@@ -204,17 +218,29 @@ def sort_cells_by_scoresheet_move_order(contours: list[np.ndarray]) -> list[dict
     return sorted_cells
 
 
-def crop_cell(gray_image: Image.Image, contour: np.ndarray) -> Image.Image:
+def crop_cell(
+    gray_image: Image.Image,
+    contour: np.ndarray,
+    border_trim_ratio: float,
+) -> Image.Image:
     x_min, y_min, x_max, y_max = contour_bounds(contour)
+    width = x_max - x_min
     height = y_max - y_min
 
-    top_padding = int(height * 0.15)
-    bottom_padding = int(height * 0.25)
+    trim_ratio = max(0.0, min(border_trim_ratio, 0.4))
+    x_trim = max(1, int(width * 0.01)) if trim_ratio > 0 else 0
+    y_trim = max(2, int(height * trim_ratio)) if trim_ratio > 0 else 0
 
-    left = max(0, x_min)
-    top = max(0, y_min - top_padding)
-    right = min(gray_image.width, x_max)
-    bottom = min(gray_image.height, y_max + bottom_padding)
+    left = max(0, x_min + x_trim)
+    top = max(0, y_min + y_trim)
+    right = min(gray_image.width, x_max - x_trim)
+    bottom = min(gray_image.height, y_max - y_trim)
+
+    if right <= left or bottom <= top:
+        left = max(0, x_min)
+        top = max(0, y_min)
+        right = min(gray_image.width, x_max)
+        bottom = min(gray_image.height, y_max)
 
     return gray_image.crop((left, top, right, bottom))
 
@@ -232,11 +258,93 @@ def trim_printed_move_number_column(
     return image.crop((left, 0, width, height))
 
 
+def odd_kernel_size_at_most(value: float, maximum: int) -> int:
+    maximum = max(1, maximum)
+    if maximum % 2 == 0:
+        maximum -= 1
+
+    size = max(3, int(value))
+    if size % 2 == 0:
+        size += 1
+
+    return min(size, maximum)
+
+
+def remove_grid_line_pixels(ink_pixels: np.ndarray) -> np.ndarray:
+    height, width = ink_pixels.shape
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (min(width, max(8, int(width * 0.45))), 1),
+    )
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, min(height, max(8, int(height * 0.60)))),
+    )
+
+    horizontal_lines = cv2.morphologyEx(
+        ink_pixels,
+        cv2.MORPH_OPEN,
+        horizontal_kernel,
+    )
+    vertical_lines = cv2.morphologyEx(
+        ink_pixels,
+        cv2.MORPH_OPEN,
+        vertical_kernel,
+    )
+    grid_lines = cv2.bitwise_or(horizontal_lines, vertical_lines)
+    grid_lines = cv2.dilate(
+        grid_lines,
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1,
+    )
+
+    return cv2.bitwise_and(ink_pixels, cv2.bitwise_not(grid_lines))
+
+
+def remove_small_ink_components(
+    ink_pixels: np.ndarray,
+    min_component_area: int = MIN_INK_COMPONENT_AREA,
+) -> np.ndarray:
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (ink_pixels > 0).astype(np.uint8),
+        8,
+    )
+    filtered_pixels = np.zeros_like(ink_pixels)
+
+    for component_index in range(1, component_count):
+        area = int(stats[component_index, cv2.CC_STAT_AREA])
+        if area >= min_component_area:
+            filtered_pixels[labels == component_index] = 255
+
+    return filtered_pixels
+
+
+def contrast_ink_pixels(gray_roi: np.ndarray) -> np.ndarray:
+    height, width = gray_roi.shape
+    kernel_size = odd_kernel_size_at_most(
+        value=max(9, height * 0.45),
+        maximum=min(height, width),
+    )
+    background_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+
+    local_background = cv2.morphologyEx(
+        gray_roi,
+        cv2.MORPH_CLOSE,
+        background_kernel,
+    )
+    dark_contrast = cv2.subtract(local_background, gray_roi)
+
+    return (dark_contrast >= INK_CONTRAST_THRESHOLD).astype(np.uint8) * 255
+
+
 def has_handwriting(image: Image.Image, min_dark_ratio: float) -> bool:
     gray = np.array(image.convert("L"))
     height, width = gray.shape
 
-    top = int(height * 0.18)
+    top = int(height * 0.12)
     bottom = int(height * 0.88)
     left = int(width * 0.06)
     right = int(width * 0.94)
@@ -245,7 +353,11 @@ def has_handwriting(image: Image.Image, min_dark_ratio: float) -> bool:
     if inner.size == 0:
         return False
 
-    return float(np.mean(inner < 170)) >= min_dark_ratio
+    handwriting_pixels = contrast_ink_pixels(inner)
+    handwriting_pixels = remove_grid_line_pixels(handwriting_pixels)
+    handwriting_pixels = remove_small_ink_components(handwriting_pixels)
+
+    return float(np.mean(handwriting_pixels > 0)) >= min_dark_ratio
 
 
 def move_cell_name(image_stem: str, cell_index: int, cell_count: int) -> str:
@@ -273,16 +385,23 @@ def save_debug_images(
     Image.fromarray(grid_lines).save(debug_dir / f"{image_stem}_grid_lines.png")
 
 
+def clear_previous_cell_images(image_output_dir: Path, image_stem: str) -> None:
+    for image_path in image_output_dir.glob(f"{image_stem}_cell_*.png"):
+        image_path.unlink()
+
+
 def extract_cells_from_image(
     image_path: Path,
     output_dir: Path,
     non_empty_only: bool,
     min_dark_ratio: float,
     trim_number_column_ratio: float,
+    cell_border_trim_ratio: float,
     save_debug: bool,
 ) -> int:
     image_output_dir = output_dir / image_path.stem
     image_output_dir.mkdir(parents=True, exist_ok=True)
+    clear_previous_cell_images(image_output_dir, image_path.stem)
 
     image = Image.open(image_path).convert("RGB")
     gray = image.convert("L")
@@ -298,7 +417,11 @@ def extract_cells_from_image(
 
     saved_count = 0
     for index, cell_info in enumerate(cells):
-        cell = crop_cell(gray, cell_info["contour"])
+        cell = crop_cell(
+            gray_image=gray,
+            contour=cell_info["contour"],
+            border_trim_ratio=cell_border_trim_ratio,
+        )
         cell = trim_printed_move_number_column(
             image=cell,
             column=cell_info["column"],
@@ -336,6 +459,7 @@ def main() -> None:
             non_empty_only=args.non_empty_only,
             min_dark_ratio=args.min_dark_ratio,
             trim_number_column_ratio=args.trim_number_column_ratio,
+            cell_border_trim_ratio=args.cell_border_trim_ratio,
             save_debug=args.save_debug,
         )
         total_saved += saved_count
