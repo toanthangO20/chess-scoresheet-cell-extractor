@@ -4,9 +4,3 @@ __pycache__/
 .venv/
 venv/
 env/
-
-outputs/*
-!outputs/.gitkeep
-
-inputs/*
-!inputs/.gitkeep
