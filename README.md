@@ -113,9 +113,10 @@ python extract_cells.py --non-empty-only
 ```
 
 The non-empty filter estimates the local paper background and keeps only pixels that
-look like darker ink strokes relative to that background. It also ignores long
-grid-line strokes so blank cells with only table borders or gray paper noise are not
-treated as handwritten content.
+look like darker ink strokes relative to that background. It removes long grid-line
+strokes from that ink mask, so cells with only the top/bottom table borders are
+treated as blank while cells with handwriting on top of those borders can still be
+kept.
 
 Tune the handwriting filter:
 
@@ -138,17 +139,17 @@ Use `0` to disable this trim:
 python extract_cells.py --trim-number-column-ratio 0
 ```
 
-By default, saved cells are cropped slightly inside the detected table borders so the
-top and bottom grid lines are removed:
+By default, saved cells include a small amount of vertical padding above and below
+the detected cell. This keeps handwriting that overlaps the top or bottom grid line:
 
 ```powershell
-python extract_cells.py --cell-border-trim-ratio 0.10
+python extract_cells.py --cell-top-padding-ratio 0.15 --cell-bottom-padding-ratio 0.25
 ```
 
-Use `0` to keep the original cell borders:
+Use `0` to crop exactly to the detected cell bounds:
 
 ```powershell
-python extract_cells.py --cell-border-trim-ratio 0
+python extract_cells.py --cell-top-padding-ratio 0 --cell-bottom-padding-ratio 0
 ```
 
 ## Troubleshooting

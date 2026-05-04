@@ -13,6 +13,8 @@ LOGGER = logging.getLogger(__name__)
 IMAGE_PATTERNS = ("*.png", "*.jpg", "*.jpeg")
 INK_CONTRAST_THRESHOLD = 20
 MIN_INK_COMPONENT_AREA = 6
+DEFAULT_CELL_TOP_PADDING_RATIO = 0.15
+DEFAULT_CELL_BOTTOM_PADDING_RATIO = 0.25
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,12 +57,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--cell-border-trim-ratio",
-        default=0.10,
+        "--cell-top-padding-ratio",
+        default=DEFAULT_CELL_TOP_PADDING_RATIO,
         type=float,
         help=(
-            "Fraction trimmed from the top and bottom of each detected cell to "
-            "remove grid borders before saving/filtering. Use 0 to keep borders."
+            "Fraction of cell height added above each detected cell before "
+            "saving/filtering. This preserves handwriting that overlaps the "
+            "upper grid line."
+        ),
+    )
+    parser.add_argument(
+        "--cell-bottom-padding-ratio",
+        default=DEFAULT_CELL_BOTTOM_PADDING_RATIO,
+        type=float,
+        help=(
+            "Fraction of cell height added below each detected cell before "
+            "saving/filtering. This preserves handwriting that overlaps the "
+            "lower grid line."
         ),
     )
     parser.add_argument(
@@ -221,26 +234,19 @@ def sort_cells_by_scoresheet_move_order(contours: list[np.ndarray]) -> list[dict
 def crop_cell(
     gray_image: Image.Image,
     contour: np.ndarray,
-    border_trim_ratio: float,
+    top_padding_ratio: float = DEFAULT_CELL_TOP_PADDING_RATIO,
+    bottom_padding_ratio: float = DEFAULT_CELL_BOTTOM_PADDING_RATIO,
 ) -> Image.Image:
     x_min, y_min, x_max, y_max = contour_bounds(contour)
-    width = x_max - x_min
     height = y_max - y_min
 
-    trim_ratio = max(0.0, min(border_trim_ratio, 0.4))
-    x_trim = max(1, int(width * 0.01)) if trim_ratio > 0 else 0
-    y_trim = max(2, int(height * trim_ratio)) if trim_ratio > 0 else 0
+    top_padding = int(height * max(0.0, top_padding_ratio))
+    bottom_padding = int(height * max(0.0, bottom_padding_ratio))
 
-    left = max(0, x_min + x_trim)
-    top = max(0, y_min + y_trim)
-    right = min(gray_image.width, x_max - x_trim)
-    bottom = min(gray_image.height, y_max - y_trim)
-
-    if right <= left or bottom <= top:
-        left = max(0, x_min)
-        top = max(0, y_min)
-        right = min(gray_image.width, x_max)
-        bottom = min(gray_image.height, y_max)
+    left = max(0, x_min)
+    top = max(0, y_min - top_padding)
+    right = min(gray_image.width, x_max)
+    bottom = min(gray_image.height, y_max + bottom_padding)
 
     return gray_image.crop((left, top, right, bottom))
 
@@ -272,6 +278,7 @@ def odd_kernel_size_at_most(value: float, maximum: int) -> int:
 
 def remove_grid_line_pixels(ink_pixels: np.ndarray) -> np.ndarray:
     height, width = ink_pixels.shape
+
     horizontal_kernel = cv2.getStructuringElement(
         cv2.MORPH_RECT,
         (min(width, max(8, int(width * 0.45))), 1),
@@ -291,12 +298,17 @@ def remove_grid_line_pixels(ink_pixels: np.ndarray) -> np.ndarray:
         cv2.MORPH_OPEN,
         vertical_kernel,
     )
-    grid_lines = cv2.bitwise_or(horizontal_lines, vertical_lines)
-    grid_lines = cv2.dilate(
-        grid_lines,
-        np.ones((3, 3), dtype=np.uint8),
+    horizontal_lines = cv2.dilate(
+        horizontal_lines,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7)),
         iterations=1,
     )
+    vertical_lines = cv2.dilate(
+        vertical_lines,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)),
+        iterations=1,
+    )
+    grid_lines = cv2.bitwise_or(horizontal_lines, vertical_lines)
 
     return cv2.bitwise_and(ink_pixels, cv2.bitwise_not(grid_lines))
 
@@ -344,10 +356,10 @@ def has_handwriting(image: Image.Image, min_dark_ratio: float) -> bool:
     gray = np.array(image.convert("L"))
     height, width = gray.shape
 
-    top = int(height * 0.12)
-    bottom = int(height * 0.88)
-    left = int(width * 0.06)
-    right = int(width * 0.94)
+    top = int(height * 0.02)
+    bottom = int(height * 0.98)
+    left = int(width * 0.04)
+    right = int(width * 0.96)
     inner = gray[top:bottom, left:right]
 
     if inner.size == 0:
@@ -396,7 +408,8 @@ def extract_cells_from_image(
     non_empty_only: bool,
     min_dark_ratio: float,
     trim_number_column_ratio: float,
-    cell_border_trim_ratio: float,
+    cell_top_padding_ratio: float,
+    cell_bottom_padding_ratio: float,
     save_debug: bool,
 ) -> int:
     image_output_dir = output_dir / image_path.stem
@@ -420,7 +433,8 @@ def extract_cells_from_image(
         cell = crop_cell(
             gray_image=gray,
             contour=cell_info["contour"],
-            border_trim_ratio=cell_border_trim_ratio,
+            top_padding_ratio=cell_top_padding_ratio,
+            bottom_padding_ratio=cell_bottom_padding_ratio,
         )
         cell = trim_printed_move_number_column(
             image=cell,
@@ -459,7 +473,8 @@ def main() -> None:
             non_empty_only=args.non_empty_only,
             min_dark_ratio=args.min_dark_ratio,
             trim_number_column_ratio=args.trim_number_column_ratio,
-            cell_border_trim_ratio=args.cell_border_trim_ratio,
+            cell_top_padding_ratio=args.cell_top_padding_ratio,
+            cell_bottom_padding_ratio=args.cell_bottom_padding_ratio,
             save_debug=args.save_debug,
         )
         total_saved += saved_count
