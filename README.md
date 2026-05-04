@@ -9,6 +9,7 @@ move boxes and save them as individual image files.
 ```text
 chess-scoresheet-cell-extractor/
   extract_cells.py
+  extract_cells.ipynb
   inputs/
   outputs/
   requirements.txt
@@ -58,15 +59,16 @@ is available on the current Windows machine.
 Copy your scoresheet images into `inputs/`, then run:
 
 ```powershell
-python extract_cells.py
+python extract_cells.py 001_0.png
 ```
 
-This reads from `inputs/` and writes to `outputs/`.
+The only command-line argument is the image file name. The script reads that file from
+`inputs/` and writes extracted cells to `outputs/<image-name>/`.
 
-You can also pass paths explicitly:
+The notebook version works the same way. Open `extract_cells.ipynb` and change only:
 
-```powershell
-python extract_cells.py --input-dir inputs --output-dir outputs
+```python
+IMAGE_FILENAME = "001_0.png"
 ```
 
 ## Output Order
@@ -98,54 +100,21 @@ scoresheet order, but the names use only sequential cell numbers:
 001_0_cell_002.png
 ```
 
-## Useful Options
+## Fixed Settings
 
-Save intermediate binary and grid-line images for debugging:
+The remaining parameters are fixed in `extract_cells.py`:
 
-```powershell
-python extract_cells.py --save-debug
-```
-
-Save only cells that appear to contain handwriting:
-
-```powershell
-python extract_cells.py --non-empty-only
-```
-
-Tune the handwriting filter:
-
-```powershell
-python extract_cells.py --non-empty-only --min-dark-ratio 0.018
-```
-
-Trim the printed move-number column from White cells:
-
-```powershell
-python extract_cells.py --trim-number-column-ratio 0.28
-```
-
-Use `0` to disable this trim:
-
-```powershell
-python extract_cells.py --trim-number-column-ratio 0
-```
+- Input directory: `inputs/`
+- Output directory: `outputs/`
+- Save only non-empty cells: `False`
+- Minimum dark-pixel ratio: `0.012`
+- Trim printed move-number column ratio: `0.28`
+- Save debug images: `False`
 
 ## Troubleshooting
 
-If `python extract_cells.py` says no images were found, check that images are directly
-inside `inputs/`, not inside another nested folder.
-
-If the script detects fewer than 120 cells, inspect the debug images:
-
-```powershell
-python extract_cells.py --save-debug
-```
-
-Debug files are saved in:
-
-```text
-outputs/_debug/
-```
+If `python extract_cells.py 001_0.png` says the input image does not exist, check that
+the image is directly inside `inputs/`, not inside another nested folder.
 
 Low-quality photos, cropped sheet borders, shadows, or tilted pages can make some grid
 lines hard to detect. In that case, try a clearer scan or crop the photo so the

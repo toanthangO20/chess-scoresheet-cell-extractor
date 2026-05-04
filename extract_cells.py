@@ -10,7 +10,13 @@ from PIL import Image
 
 
 LOGGER = logging.getLogger(__name__)
-IMAGE_PATTERNS = ("*.png", "*.jpg", "*.jpeg")
+INPUT_DIR = Path("inputs")
+OUTPUT_DIR = Path("outputs")
+NON_EMPTY_ONLY = False
+MIN_DARK_RATIO = 0.012
+TRIM_NUMBER_COLUMN_RATIO = 0.28
+SAVE_DEBUG = False
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,50 +24,22 @@ def parse_args() -> argparse.Namespace:
         description="Extract handwritten move cells from chess scoresheet photos."
     )
     parser.add_argument(
-        "--input-dir",
-        default=Path("inputs"),
-        type=Path,
-        help="Directory containing scoresheet images. Defaults to inputs/.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=Path("outputs"),
-        type=Path,
-        help="Directory where extracted cells are saved. Defaults to outputs/.",
-    )
-    parser.add_argument(
-        "--non-empty-only",
-        action="store_true",
-        help="Save only cells that appear to contain handwriting.",
-    )
-    parser.add_argument(
-        "--min-dark-ratio",
-        default=0.012,
-        type=float,
-        help="Minimum dark-pixel ratio used by --non-empty-only.",
-    )
-    parser.add_argument(
-        "--trim-number-column-ratio",
-        default=0.28,
-        type=float,
-        help=(
-            "Fraction trimmed from the left side of White cells to remove the "
-            "printed move-number column. Use 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--save-debug",
-        action="store_true",
-        help="Save threshold and grid-line images under outputs/_debug/.",
+        "image_filename",
+        help="Image file name inside inputs/, for example 001_0.png.",
     )
     return parser.parse_args()
 
 
-def iter_image_paths(input_dir: Path) -> list[Path]:
-    image_paths: list[Path] = []
-    for pattern in IMAGE_PATTERNS:
-        image_paths.extend(input_dir.glob(pattern))
-    return sorted(image_paths)
+def resolve_input_image_path(image_filename: str) -> Path:
+    image_path = Path(image_filename)
+    if image_path.name != image_filename:
+        raise ValueError("Pass only the image file name, for example: 001_0.png")
+
+    if image_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_SUFFIXES))
+        raise ValueError(f"Unsupported image extension. Supported: {supported}")
+
+    return INPUT_DIR / image_path.name
 
 
 def image_to_binary(gray_image: Image.Image) -> np.ndarray:
@@ -319,29 +297,33 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
     args = parse_args()
 
-    if not args.input_dir.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {args.input_dir}")
+    if not INPUT_DIR.exists():
+        raise SystemExit(f"ERROR - Input directory does not exist: {INPUT_DIR}")
 
-    image_paths = iter_image_paths(args.input_dir)
-    if not image_paths:
-        raise FileNotFoundError(f"No PNG/JPG images found in: {args.input_dir}")
+    try:
+        image_path = resolve_input_image_path(args.image_filename)
+    except ValueError as error:
+        raise SystemExit(f"ERROR - {error}") from None
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if not image_path.exists():
+        raise SystemExit(f"ERROR - Input image does not exist: {image_path}")
 
-    total_saved = 0
-    for image_path in image_paths:
-        saved_count = extract_cells_from_image(
-            image_path=image_path,
-            output_dir=args.output_dir,
-            non_empty_only=args.non_empty_only,
-            min_dark_ratio=args.min_dark_ratio,
-            trim_number_column_ratio=args.trim_number_column_ratio,
-            save_debug=args.save_debug,
-        )
-        total_saved += saved_count
-        LOGGER.info("Saved %s cells for %s", saved_count, image_path.name)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info("Done. Saved %s cells to %s", total_saved, args.output_dir)
+    saved_count = extract_cells_from_image(
+        image_path=image_path,
+        output_dir=OUTPUT_DIR,
+        non_empty_only=NON_EMPTY_ONLY,
+        min_dark_ratio=MIN_DARK_RATIO,
+        trim_number_column_ratio=TRIM_NUMBER_COLUMN_RATIO,
+        save_debug=SAVE_DEBUG,
+    )
+    LOGGER.info(
+        "Done. Saved %s cells for %s to %s",
+        saved_count,
+        image_path.name,
+        OUTPUT_DIR,
+    )
 
 
 if __name__ == "__main__":
