@@ -64,6 +64,8 @@ python extract_cells.py 001_0.png
 
 The only command-line argument is the image file name. The script reads that file from
 `inputs/` and writes extracted cells to `outputs/<image-name>/`.
+Each scoresheet is reconstructed as a fixed 30-row by 4-move-cell grid, so the output
+contains 120 cell images before any optional non-empty-cell filtering.
 
 The notebook version works the same way. Open `extract_cells.ipynb` and change only:
 
