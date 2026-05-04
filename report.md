@@ -395,7 +395,7 @@ Nếu người viết ghi chữ quá sát mép trái, việc cắt bỏ `28%` c�
 
 ### Phương pháp
 
-Chương trình có tùy chọn `--non-empty-only` để chỉ lưu các ô có khả năng chứa chữ viết tay.
+Chương trình có tham số cố định `NON_EMPTY_ONLY = False`, nên mặc định lưu toàn bộ các ô phát hiện được. Nếu cần bật lọc về sau, chỉnh hằng số này trong source code; notebook sẽ dùng lại cấu hình đó.
 
 Với mỗi ảnh ô, chương trình xét vùng bên trong ô và bỏ qua phần rìa ảnh. Sau đó tính tỉ lệ điểm ảnh tối trong vùng này.
 
@@ -430,7 +430,7 @@ Nếu chữ viết tay quá nhạt, tỉ lệ điểm ảnh tối có thể nh�
 
 ## 5. Kết quả trung gian cần quan sát
 
-Chương trình có tùy chọn `--save-debug` để lưu các ảnh trung gian quan trọng vào thư mục debug.
+Chương trình có tham số cố định `SAVE_DEBUG = False`. Nếu cần lưu debug về sau, chỉnh hằng số này trong source code; notebook sẽ dùng lại cấu hình đó.
 
 Các ảnh trung gian gồm:
 

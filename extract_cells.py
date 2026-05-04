@@ -10,11 +10,20 @@ from PIL import Image
 
 
 LOGGER = logging.getLogger(__name__)
-IMAGE_PATTERNS = ("*.png", "*.jpg", "*.jpeg")
+INPUT_DIR = Path("inputs")
+OUTPUT_DIR = Path("outputs")
+NON_EMPTY_ONLY = False
+MIN_DARK_RATIO = 0.012
+TRIM_NUMBER_COLUMN_RATIO = 0.28
+CELL_TOP_PADDING_RATIO = 0.15
+CELL_BOTTOM_PADDING_RATIO = 0.25
+SAVE_DEBUG = False
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 INK_CONTRAST_THRESHOLD = 20
 MIN_INK_COMPONENT_AREA = 6
-DEFAULT_CELL_TOP_PADDING_RATIO = 0.15
-DEFAULT_CELL_BOTTOM_PADDING_RATIO = 0.25
+SCORESHEET_ROWS = 30
+SCORESHEET_MOVE_COLUMNS = 4
+EXPECTED_MOVE_CELLS = SCORESHEET_ROWS * SCORESHEET_MOVE_COLUMNS
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,73 +31,22 @@ def parse_args() -> argparse.Namespace:
         description="Extract handwritten move cells from chess scoresheet photos."
     )
     parser.add_argument(
-        "--input-dir",
-        default=Path("inputs"),
-        type=Path,
-        help="Directory containing scoresheet images. Defaults to inputs/.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=Path("outputs"),
-        type=Path,
-        help="Directory where extracted cells are saved. Defaults to outputs/.",
-    )
-    parser.add_argument(
-        "--non-empty-only",
-        action="store_true",
-        help="Save only cells that appear to contain handwriting.",
-    )
-    parser.add_argument(
-        "--min-dark-ratio",
-        default=0.012,
-        type=float,
-        help=(
-            "Minimum contrast-ink pixel ratio used by --non-empty-only. "
-            "Higher values filter more aggressively."
-        ),
-    )
-    parser.add_argument(
-        "--trim-number-column-ratio",
-        default=0.28,
-        type=float,
-        help=(
-            "Fraction trimmed from the left side of White cells to remove the "
-            "printed move-number column. Use 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--cell-top-padding-ratio",
-        default=DEFAULT_CELL_TOP_PADDING_RATIO,
-        type=float,
-        help=(
-            "Fraction of cell height added above each detected cell before "
-            "saving/filtering. This preserves handwriting that overlaps the "
-            "upper grid line."
-        ),
-    )
-    parser.add_argument(
-        "--cell-bottom-padding-ratio",
-        default=DEFAULT_CELL_BOTTOM_PADDING_RATIO,
-        type=float,
-        help=(
-            "Fraction of cell height added below each detected cell before "
-            "saving/filtering. This preserves handwriting that overlaps the "
-            "lower grid line."
-        ),
-    )
-    parser.add_argument(
-        "--save-debug",
-        action="store_true",
-        help="Save threshold and grid-line images under outputs/_debug/.",
+        "image_filename",
+        help="Image file name inside inputs/, for example 001_0.png.",
     )
     return parser.parse_args()
 
 
-def iter_image_paths(input_dir: Path) -> list[Path]:
-    image_paths: list[Path] = []
-    for pattern in IMAGE_PATTERNS:
-        image_paths.extend(input_dir.glob(pattern))
-    return sorted(image_paths)
+def resolve_input_image_path(image_filename: str) -> Path:
+    image_path = Path(image_filename)
+    if image_path.name != image_filename:
+        raise ValueError("Pass only the image file name, for example: 001_0.png")
+
+    if image_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_SUFFIXES))
+        raise ValueError(f"Unsupported image extension. Supported: {supported}")
+
+    return INPUT_DIR / image_path.name
 
 
 def image_to_binary(gray_image: Image.Image) -> np.ndarray:
@@ -231,11 +189,171 @@ def sort_cells_by_scoresheet_move_order(contours: list[np.ndarray]) -> list[dict
     return sorted_cells
 
 
+def median_float(values: list[float]) -> float:
+    if not values:
+        raise ValueError("Cannot compute median from an empty list.")
+    return float(np.median(values))
+
+
+def rectangle_contour(
+    x_min: int,
+    y_min: int,
+    x_max: int,
+    y_max: int,
+) -> np.ndarray:
+    return np.array(
+        [
+            [x_min, y_min],
+            [x_max, y_min],
+            [x_max, y_max],
+            [x_min, y_max],
+        ],
+        dtype=np.int32,
+    )
+
+
+def estimate_row_step(observed_row_centers: list[float]) -> float:
+    if len(observed_row_centers) < 2:
+        raise ValueError("At least two detected rows are required to estimate spacing.")
+
+    gaps = np.diff(sorted(observed_row_centers))
+    median_gap = float(np.median(gaps))
+    regular_gaps = [gap for gap in gaps if gap <= median_gap * 1.5]
+    return float(np.median(regular_gaps or gaps))
+
+
+def estimate_scoresheet_row_centers(
+    detected_cells: list[dict],
+    image_height: int,
+) -> list[float]:
+    row_centers_by_index: dict[int, list[float]] = {}
+    for cell in detected_cells:
+        row = cell.get("row")
+        if row is not None:
+            row_centers_by_index.setdefault(row, []).append(float(cell["y_center"]))
+
+    observed_centers = [
+        median_float(centers)
+        for _, centers in sorted(row_centers_by_index.items())
+    ]
+    row_step = estimate_row_step(observed_centers)
+    first_observed_center = observed_centers[0]
+
+    best_score = float("inf")
+    best_first_center: float | None = None
+    for observed_row_index in range(SCORESHEET_ROWS):
+        first_center = first_observed_center - observed_row_index * row_step
+        last_center = first_center + (SCORESHEET_ROWS - 1) * row_step
+
+        if first_center < -0.5 * row_step or first_center > 1.75 * row_step:
+            continue
+        if (
+            last_center < image_height - 2.5 * row_step
+            or last_center > image_height + 0.75 * row_step
+        ):
+            continue
+
+        full_centers = [
+            first_center + row_index * row_step
+            for row_index in range(SCORESHEET_ROWS)
+        ]
+        residuals = [
+            min(abs(observed - center) for center in full_centers)
+            for observed in observed_centers
+        ]
+        score = float(np.mean(np.square(residuals)))
+        if score < best_score:
+            best_score = score
+            best_first_center = first_center
+
+    if best_first_center is None:
+        best_first_center = max(
+            0.0,
+            min(first_observed_center, image_height - (SCORESHEET_ROWS - 1) * row_step),
+        )
+
+    return [
+        best_first_center + row_index * row_step
+        for row_index in range(SCORESHEET_ROWS)
+    ]
+
+
+def reconstruct_scoresheet_grid_cells(
+    detected_cells: list[dict],
+    image_size: tuple[int, int],
+) -> list[dict]:
+    image_width, image_height = image_size
+
+    column_bounds: list[tuple[int, int]] = []
+    for column in range(SCORESHEET_MOVE_COLUMNS):
+        column_cells = [
+            cell for cell in detected_cells if cell.get("column") == column
+        ]
+        if not column_cells:
+            raise ValueError(f"No detected cells found for column {column}.")
+
+        left_edges = []
+        right_edges = []
+        for cell in column_cells:
+            x_min, _, x_max, _ = contour_bounds(cell["contour"])
+            left_edges.append(float(x_min))
+            right_edges.append(float(x_max))
+
+        left = max(0, int(round(median_float(left_edges))))
+        right = min(image_width, int(round(median_float(right_edges))))
+        if right <= left:
+            raise ValueError(f"Invalid estimated bounds for column {column}.")
+        column_bounds.append((left, right))
+
+    top_offsets = []
+    bottom_offsets = []
+    for cell in detected_cells:
+        _, y_min, _, y_max = contour_bounds(cell["contour"])
+        y_center = float(cell["y_center"])
+        top_offsets.append(y_center - y_min)
+        bottom_offsets.append(y_max - y_center)
+
+    top_offset = median_float(top_offsets)
+    bottom_offset = median_float(bottom_offsets)
+    row_centers = estimate_scoresheet_row_centers(detected_cells, image_height)
+
+    reconstructed_cells: list[dict] = []
+    for columns in ((0, 1), (2, 3)):
+        for row_index, y_center in enumerate(row_centers):
+            y_min = max(0, int(round(y_center - top_offset)))
+            y_max = min(image_height, int(round(y_center + bottom_offset)))
+            for column in columns:
+                x_min, x_max = column_bounds[column]
+                contour = rectangle_contour(x_min, y_min, x_max, y_max)
+                reconstructed_cells.append(
+                    {
+                        "contour": contour,
+                        "column": column,
+                        "row": row_index,
+                        "x_center": x_min + (x_max - x_min) / 2,
+                        "y_center": y_center,
+                        "height": y_max - y_min,
+                    }
+                )
+
+    return reconstructed_cells
+
+
+def complete_scoresheet_cells(
+    detected_cells: list[dict],
+    image_size: tuple[int, int],
+) -> list[dict]:
+    if len(detected_cells) == EXPECTED_MOVE_CELLS:
+        return detected_cells
+
+    return reconstruct_scoresheet_grid_cells(detected_cells, image_size)
+
+
 def crop_cell(
     gray_image: Image.Image,
     contour: np.ndarray,
-    top_padding_ratio: float = DEFAULT_CELL_TOP_PADDING_RATIO,
-    bottom_padding_ratio: float = DEFAULT_CELL_BOTTOM_PADDING_RATIO,
+    top_padding_ratio: float = CELL_TOP_PADDING_RATIO,
+    bottom_padding_ratio: float = CELL_BOTTOM_PADDING_RATIO,
 ) -> Image.Image:
     x_min, y_min, x_max, y_max = contour_bounds(contour)
     height = y_max - y_min
@@ -425,8 +543,14 @@ def extract_cells_from_image(
         save_debug_images(output_dir, image_path.stem, binary, grid_lines)
 
     contours = find_move_cell_contours(grid_lines)
-    cells = sort_cells_by_scoresheet_move_order(contours)
-    LOGGER.info("Detected %s move-cell contours in %s", len(cells), image_path.name)
+    detected_cells = sort_cells_by_scoresheet_move_order(contours)
+    cells = complete_scoresheet_cells(detected_cells, gray.size)
+    LOGGER.info(
+        "Detected %s move-cell contours in %s; using %s cells for output",
+        len(detected_cells),
+        image_path.name,
+        len(cells),
+    )
 
     saved_count = 0
     for index, cell_info in enumerate(cells):
@@ -456,31 +580,35 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
     args = parse_args()
 
-    if not args.input_dir.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {args.input_dir}")
+    if not INPUT_DIR.exists():
+        raise SystemExit(f"ERROR - Input directory does not exist: {INPUT_DIR}")
 
-    image_paths = iter_image_paths(args.input_dir)
-    if not image_paths:
-        raise FileNotFoundError(f"No PNG/JPG images found in: {args.input_dir}")
+    try:
+        image_path = resolve_input_image_path(args.image_filename)
+    except ValueError as error:
+        raise SystemExit(f"ERROR - {error}") from None
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if not image_path.exists():
+        raise SystemExit(f"ERROR - Input image does not exist: {image_path}")
 
-    total_saved = 0
-    for image_path in image_paths:
-        saved_count = extract_cells_from_image(
-            image_path=image_path,
-            output_dir=args.output_dir,
-            non_empty_only=args.non_empty_only,
-            min_dark_ratio=args.min_dark_ratio,
-            trim_number_column_ratio=args.trim_number_column_ratio,
-            cell_top_padding_ratio=args.cell_top_padding_ratio,
-            cell_bottom_padding_ratio=args.cell_bottom_padding_ratio,
-            save_debug=args.save_debug,
-        )
-        total_saved += saved_count
-        LOGGER.info("Saved %s cells for %s", saved_count, image_path.name)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info("Done. Saved %s cells to %s", total_saved, args.output_dir)
+    saved_count = extract_cells_from_image(
+        image_path=image_path,
+        output_dir=OUTPUT_DIR,
+        non_empty_only=NON_EMPTY_ONLY,
+        min_dark_ratio=MIN_DARK_RATIO,
+        trim_number_column_ratio=TRIM_NUMBER_COLUMN_RATIO,
+        cell_top_padding_ratio=CELL_TOP_PADDING_RATIO,
+        cell_bottom_padding_ratio=CELL_BOTTOM_PADDING_RATIO,
+        save_debug=SAVE_DEBUG,
+    )
+    LOGGER.info(
+        "Done. Saved %s cells for %s to %s",
+        saved_count,
+        image_path.name,
+        OUTPUT_DIR,
+    )
 
 
 if __name__ == "__main__":

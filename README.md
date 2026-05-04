@@ -9,6 +9,7 @@ move boxes and save them as individual image files.
 ```text
 chess-scoresheet-cell-extractor/
   extract_cells.py
+  extract_cells.ipynb
   inputs/
   outputs/
   requirements.txt
@@ -58,15 +59,18 @@ is available on the current Windows machine.
 Copy your scoresheet images into `inputs/`, then run:
 
 ```powershell
-python extract_cells.py
+python extract_cells.py 001_0.png
 ```
 
-This reads from `inputs/` and writes to `outputs/`.
+The only command-line argument is the image file name. The script reads that file from
+`inputs/` and writes extracted cells to `outputs/<image-name>/`.
+Each scoresheet is reconstructed as a fixed 30-row by 4-move-cell grid, so the output
+contains 120 cell images before any optional non-empty-cell filtering.
 
-You can also pass paths explicitly:
+The notebook version works the same way. Open `extract_cells.ipynb` and change only:
 
-```powershell
-python extract_cells.py --input-dir inputs --output-dir outputs
+```python
+IMAGE_FILENAME = "001_0.png"
 ```
 
 ## Output Order
@@ -90,84 +94,29 @@ For a fully detected 120-cell sheet, file names look like this:
 001_0_cell_062_move_31_black.png
 ```
 
-If the script detects fewer or more than 120 cells, it still saves them in detected
-scoresheet order, but the names use only sequential cell numbers:
+If the contour detector finds fewer than 120 cells, the script reconstructs the
+missing cells from the detected scoresheet grid and still saves 120 cells.
 
-```text
-001_0_cell_001.png
-001_0_cell_002.png
-```
+## Fixed Settings
 
-## Useful Options
+The remaining parameters are fixed in `extract_cells.py`:
 
-Save intermediate binary and grid-line images for debugging:
-
-```powershell
-python extract_cells.py --save-debug
-```
-
-Save only cells that appear to contain handwriting:
-
-```powershell
-python extract_cells.py --non-empty-only
-```
-
-The non-empty filter estimates the local paper background and keeps only pixels that
-look like darker ink strokes relative to that background. It removes long grid-line
-strokes from that ink mask, so cells with only the top/bottom table borders are
-treated as blank while cells with handwriting on top of those borders can still be
-kept.
-
-Tune the handwriting filter:
-
-```powershell
-python extract_cells.py --non-empty-only --min-dark-ratio 0.018
-```
-
-Despite the option name, this now controls the minimum contrast-ink pixel ratio, not
-an absolute dark-pixel ratio.
-
-Trim the printed move-number column from White cells:
-
-```powershell
-python extract_cells.py --trim-number-column-ratio 0.28
-```
-
-Use `0` to disable this trim:
-
-```powershell
-python extract_cells.py --trim-number-column-ratio 0
-```
+- Input directory: `inputs/`
+- Output directory: `outputs/`
+- Save only non-empty cells: `False`
+- Minimum contrast-ink pixel ratio: `0.012`
+- Trim printed move-number column ratio: `0.28`
+- Cell top padding ratio: `0.15`
+- Cell bottom padding ratio: `0.25`
+- Save debug images: `False`
 
 By default, saved cells include a small amount of vertical padding above and below
-the detected cell. This keeps handwriting that overlaps the top or bottom grid line:
-
-```powershell
-python extract_cells.py --cell-top-padding-ratio 0.15 --cell-bottom-padding-ratio 0.25
-```
-
-Use `0` to crop exactly to the detected cell bounds:
-
-```powershell
-python extract_cells.py --cell-top-padding-ratio 0 --cell-bottom-padding-ratio 0
-```
+the detected cell. This keeps handwriting that overlaps the top or bottom grid line.
 
 ## Troubleshooting
 
-If `python extract_cells.py` says no images were found, check that images are directly
-inside `inputs/`, not inside another nested folder.
-
-If the script detects fewer than 120 cells, inspect the debug images:
-
-```powershell
-python extract_cells.py --save-debug
-```
-
-Debug files are saved in:
-
-```text
-outputs/_debug/
-```
+If `python extract_cells.py 001_0.png` says the input image does not exist, check that
+the image is directly inside `inputs/`, not inside another nested folder.
 
 Low-quality photos, cropped sheet borders, shadows, or tilted pages can make some grid
 lines hard to detect. In that case, try a clearer scan or crop the photo so the
