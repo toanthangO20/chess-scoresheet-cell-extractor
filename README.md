@@ -9,7 +9,7 @@ move boxes and save them as individual image files.
 ```text
 chess-scoresheet-cell-extractor/
   extract_cells.py
-  extract_cells.ipynb
+  kaggle_pipeline_demo.ipynb
   inputs/
   outputs/
   requirements.txt
@@ -66,12 +66,6 @@ The only command-line argument is the image file name. The script reads that fil
 `inputs/` and writes extracted cells to `outputs/<image-name>/`.
 Each scoresheet is reconstructed as a fixed 30-row by 4-move-cell grid, so the output
 contains 120 cell images before any optional non-empty-cell filtering.
-
-The notebook version works the same way. Open `extract_cells.ipynb` and change only:
-
-```python
-IMAGE_FILENAME = "001_0.png"
-```
 
 ## Output Order
 
