@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -17,6 +19,10 @@ MIN_DARK_RATIO = 0.012
 TRIM_NUMBER_COLUMN_RATIO = 0.28
 CELL_TOP_PADDING_RATIO = 0.15
 CELL_BOTTOM_PADDING_RATIO = 0.25
+DETECTION_VERTICAL_MARGIN_RATIO = 0.18
+DETECTION_HORIZONTAL_MARGIN_RATIO = 0.04
+STOP_AFTER_FIRST_EMPTY = True
+EMPTY_LOOKAHEAD = 0
 SAVE_DEBUG = False
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 INK_CONTRAST_THRESHOLD = 20
@@ -24,6 +30,41 @@ MIN_INK_COMPONENT_AREA = 6
 SCORESHEET_ROWS = 30
 SCORESHEET_MOVE_COLUMNS = 4
 EXPECTED_MOVE_CELLS = SCORESHEET_ROWS * SCORESHEET_MOVE_COLUMNS
+MANIFEST_FIELDNAMES = [
+    "image_name",
+    "cell_index",
+    "move_number",
+    "side",
+    "row",
+    "column",
+    "bbox_x_min",
+    "bbox_y_min",
+    "bbox_x_max",
+    "bbox_y_max",
+    "detection_bbox_x_min",
+    "detection_bbox_y_min",
+    "detection_bbox_x_max",
+    "detection_bbox_y_max",
+    "ink_ratio",
+    "detected_non_empty",
+    "after_cutoff",
+    "saved",
+    "reject_reason",
+    "file_name",
+]
+
+
+@dataclass
+class ExtractionResult:
+    saved_count: int
+    contour_count: int
+    detected_cell_count: int
+    output_cell_count: int
+    raw_non_empty_count: int
+    cutoff_index: int | None
+    blank_rejected_count: int
+    after_cutoff_rejected_count: int
+    manifest_records: list[dict]
 
 
 def parse_args() -> argparse.Namespace:
@@ -382,6 +423,61 @@ def trim_printed_move_number_column(
     return image.crop((left, 0, width, height))
 
 
+def bounded_margin_ratio(ratio: float) -> float:
+    return min(max(float(ratio), 0.0), 0.45)
+
+
+def detection_region_bounds(
+    contour: np.ndarray,
+    image_size: tuple[int, int],
+    column: int | None,
+    trim_number_column_ratio: float,
+    detection_vertical_margin_ratio: float,
+    detection_horizontal_margin_ratio: float,
+) -> tuple[int, int, int, int]:
+    x_min, y_min, x_max, y_max = contour_bounds(contour)
+    image_width, image_height = image_size
+    width = max(1, x_max - x_min)
+    height = max(1, y_max - y_min)
+
+    vertical_margin = bounded_margin_ratio(detection_vertical_margin_ratio)
+    horizontal_margin = bounded_margin_ratio(detection_horizontal_margin_ratio)
+
+    left = x_min + int(round(width * horizontal_margin))
+    right = x_max - int(round(width * horizontal_margin))
+    top = y_min + int(round(height * vertical_margin))
+    bottom = y_max - int(round(height * vertical_margin))
+
+    if trim_number_column_ratio > 0 and column in (0, 2):
+        left = max(left, x_min + int(round(width * trim_number_column_ratio)))
+
+    left = min(max(left, 0), max(0, image_width - 1))
+    right = min(max(right, left + 1), image_width)
+    top = min(max(top, 0), max(0, image_height - 1))
+    bottom = min(max(bottom, top + 1), image_height)
+
+    return left, top, right, bottom
+
+
+def crop_cell_detection_region(
+    gray_image: Image.Image,
+    contour: np.ndarray,
+    column: int | None,
+    trim_number_column_ratio: float = TRIM_NUMBER_COLUMN_RATIO,
+    detection_vertical_margin_ratio: float = DETECTION_VERTICAL_MARGIN_RATIO,
+    detection_horizontal_margin_ratio: float = DETECTION_HORIZONTAL_MARGIN_RATIO,
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    bounds = detection_region_bounds(
+        contour=contour,
+        image_size=gray_image.size,
+        column=column,
+        trim_number_column_ratio=trim_number_column_ratio,
+        detection_vertical_margin_ratio=detection_vertical_margin_ratio,
+        detection_horizontal_margin_ratio=detection_horizontal_margin_ratio,
+    )
+    return gray_image.crop(bounds), bounds
+
+
 def odd_kernel_size_at_most(value: float, maximum: int) -> int:
     maximum = max(1, maximum)
     if maximum % 2 == 0:
@@ -470,7 +566,10 @@ def contrast_ink_pixels(gray_roi: np.ndarray) -> np.ndarray:
     return (dark_contrast >= INK_CONTRAST_THRESHOLD).astype(np.uint8) * 255
 
 
-def has_handwriting(image: Image.Image, min_dark_ratio: float) -> bool:
+def handwriting_ink_analysis(
+    image: Image.Image,
+    min_dark_ratio: float,
+) -> dict[str, object]:
     gray = np.array(image.convert("L"))
     height, width = gray.shape
 
@@ -481,26 +580,114 @@ def has_handwriting(image: Image.Image, min_dark_ratio: float) -> bool:
     inner = gray[top:bottom, left:right]
 
     if inner.size == 0:
-        return False
+        empty_mask = np.zeros((0, 0), dtype=np.uint8)
+        return {
+            "roi": inner,
+            "contrast_ink": empty_mask,
+            "without_grid": empty_mask,
+            "final_ink": empty_mask,
+            "ink_ratio": 0.0,
+            "non_empty": False,
+        }
 
     handwriting_pixels = contrast_ink_pixels(inner)
-    handwriting_pixels = remove_grid_line_pixels(handwriting_pixels)
-    handwriting_pixels = remove_small_ink_components(handwriting_pixels)
+    without_grid = remove_grid_line_pixels(handwriting_pixels)
+    final_ink = remove_small_ink_components(without_grid)
+    ink_ratio = float(np.mean(final_ink > 0))
 
-    return float(np.mean(handwriting_pixels > 0)) >= min_dark_ratio
+    return {
+        "roi": inner,
+        "contrast_ink": handwriting_pixels,
+        "without_grid": without_grid,
+        "final_ink": final_ink,
+        "ink_ratio": ink_ratio,
+        "non_empty": ink_ratio >= min_dark_ratio,
+    }
+
+
+def has_handwriting(image: Image.Image, min_dark_ratio: float) -> bool:
+    analysis = handwriting_ink_analysis(image, min_dark_ratio)
+    return bool(analysis["non_empty"])
+
+
+def analyze_cell_handwriting(
+    gray_image: Image.Image,
+    cell_info: dict,
+    min_dark_ratio: float,
+    trim_number_column_ratio: float,
+    detection_vertical_margin_ratio: float,
+    detection_horizontal_margin_ratio: float,
+) -> dict[str, object]:
+    detection_image, detection_bbox = crop_cell_detection_region(
+        gray_image=gray_image,
+        contour=cell_info["contour"],
+        column=cell_info.get("column"),
+        trim_number_column_ratio=trim_number_column_ratio,
+        detection_vertical_margin_ratio=detection_vertical_margin_ratio,
+        detection_horizontal_margin_ratio=detection_horizontal_margin_ratio,
+    )
+    analysis = handwriting_ink_analysis(detection_image, min_dark_ratio)
+    analysis["detection_image"] = detection_image
+    analysis["detection_bbox"] = detection_bbox
+    return analysis
 
 
 def move_cell_name(image_stem: str, cell_index: int, cell_count: int) -> str:
-    if cell_count != 120:
+    if cell_count != EXPECTED_MOVE_CELLS:
         return f"{image_stem}_cell_{cell_index + 1:03d}.png"
 
-    if cell_index < 60:
+    move_number, side = move_cell_position(cell_index, cell_count)
+    return f"{image_stem}_cell_{cell_index + 1:03d}_move_{move_number:02d}_{side}.png"
+
+
+def move_cell_position(
+    cell_index: int,
+    cell_count: int,
+) -> tuple[int | None, str | None]:
+    if cell_count != EXPECTED_MOVE_CELLS:
+        return None, None
+
+    first_panel_cell_count = SCORESHEET_ROWS * 2
+    if cell_index < first_panel_cell_count:
         move_number = (cell_index // 2) + 1
     else:
-        move_number = ((cell_index - 60) // 2) + 31
+        move_number = (
+            (cell_index - first_panel_cell_count) // 2
+        ) + SCORESHEET_ROWS + 1
 
     side = "white" if cell_index % 2 == 0 else "black"
-    return f"{image_stem}_cell_{cell_index + 1:03d}_move_{move_number:02d}_{side}.png"
+    return move_number, side
+
+
+def find_first_confirmed_empty_index(
+    non_empty_flags: list[bool],
+    empty_lookahead: int = EMPTY_LOOKAHEAD,
+) -> int | None:
+    lookahead = max(0, int(empty_lookahead))
+    required_empty_count = lookahead + 1
+
+    for index, non_empty in enumerate(non_empty_flags):
+        if non_empty:
+            continue
+
+        window = non_empty_flags[index : index + required_empty_count]
+        has_required_window = len(window) == required_empty_count
+        reaches_end = index + len(window) == len(non_empty_flags)
+        if not any(window) and (has_required_window or reaches_end):
+            return index
+
+    return None
+
+
+def write_manifest_csv(
+    manifest_path: Path,
+    manifest_records: list[dict],
+) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", newline="", encoding="utf-8") as manifest_file:
+        writer = csv.DictWriter(manifest_file, fieldnames=MANIFEST_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(manifest_records)
 
 
 def save_debug_images(
@@ -520,7 +707,7 @@ def clear_previous_cell_images(image_output_dir: Path, image_stem: str) -> None:
         image_path.unlink()
 
 
-def extract_cells_from_image(
+def extract_cells_from_image_with_diagnostics(
     image_path: Path,
     output_dir: Path,
     non_empty_only: bool,
@@ -529,7 +716,12 @@ def extract_cells_from_image(
     cell_top_padding_ratio: float,
     cell_bottom_padding_ratio: float,
     save_debug: bool,
-) -> int:
+    detection_vertical_margin_ratio: float = DETECTION_VERTICAL_MARGIN_RATIO,
+    detection_horizontal_margin_ratio: float = DETECTION_HORIZONTAL_MARGIN_RATIO,
+    stop_after_first_empty: bool = STOP_AFTER_FIRST_EMPTY,
+    empty_lookahead: int = EMPTY_LOOKAHEAD,
+    manifest_path: Path | None = None,
+) -> ExtractionResult:
     image_output_dir = output_dir / image_path.stem
     image_output_dir.mkdir(parents=True, exist_ok=True)
     clear_previous_cell_images(image_output_dir, image_path.stem)
@@ -552,7 +744,30 @@ def extract_cells_from_image(
         len(cells),
     )
 
+    analyses = [
+        analyze_cell_handwriting(
+            gray_image=gray,
+            cell_info=cell_info,
+            min_dark_ratio=min_dark_ratio,
+            trim_number_column_ratio=trim_number_column_ratio,
+            detection_vertical_margin_ratio=detection_vertical_margin_ratio,
+            detection_horizontal_margin_ratio=detection_horizontal_margin_ratio,
+        )
+        for cell_info in cells
+    ]
+    non_empty_flags = [bool(analysis["non_empty"]) for analysis in analyses]
+    cutoff_index = None
+    if non_empty_only and stop_after_first_empty:
+        cutoff_index = find_first_confirmed_empty_index(
+            non_empty_flags,
+            empty_lookahead=empty_lookahead,
+        )
+
     saved_count = 0
+    blank_rejected_count = 0
+    after_cutoff_rejected_count = 0
+    manifest_records: list[dict] = []
+
     for index, cell_info in enumerate(cells):
         cell = crop_cell(
             gray_image=gray,
@@ -566,14 +781,111 @@ def extract_cells_from_image(
             trim_ratio=trim_number_column_ratio,
         )
 
-        if non_empty_only and not has_handwriting(cell, min_dark_ratio):
-            continue
-
+        analysis = analyses[index]
+        raw_non_empty = bool(analysis["non_empty"])
+        is_cutoff_cell = cutoff_index is not None and index == cutoff_index
+        after_cutoff = cutoff_index is not None and index > cutoff_index
         file_name = move_cell_name(image_path.stem, index, len(cells))
-        cell.save(image_output_dir / file_name)
-        saved_count += 1
 
-    return saved_count
+        save_cell = True
+        reject_reason = ""
+        if non_empty_only:
+            if stop_after_first_empty:
+                save_cell = cutoff_index is None or index < cutoff_index
+                if is_cutoff_cell:
+                    reject_reason = "blank"
+                elif after_cutoff:
+                    reject_reason = "after_cutoff"
+            else:
+                save_cell = raw_non_empty
+                if not raw_non_empty:
+                    reject_reason = "blank"
+
+        if non_empty_only and not save_cell:
+            if reject_reason == "after_cutoff":
+                after_cutoff_rejected_count += 1
+            else:
+                blank_rejected_count += 1
+
+        if save_cell:
+            cell.save(image_output_dir / file_name)
+            saved_count += 1
+
+        move_number, side = move_cell_position(index, len(cells))
+        bbox = contour_bounds(cell_info["contour"])
+        detection_bbox = analysis["detection_bbox"]
+        manifest_records.append(
+            {
+                "image_name": image_path.name,
+                "cell_index": index + 1,
+                "move_number": move_number or "",
+                "side": side or "",
+                "row": cell_info.get("row", ""),
+                "column": cell_info.get("column", ""),
+                "bbox_x_min": bbox[0],
+                "bbox_y_min": bbox[1],
+                "bbox_x_max": bbox[2],
+                "bbox_y_max": bbox[3],
+                "detection_bbox_x_min": detection_bbox[0],
+                "detection_bbox_y_min": detection_bbox[1],
+                "detection_bbox_x_max": detection_bbox[2],
+                "detection_bbox_y_max": detection_bbox[3],
+                "ink_ratio": f"{float(analysis['ink_ratio']):.6f}",
+                "detected_non_empty": raw_non_empty,
+                "after_cutoff": after_cutoff,
+                "saved": save_cell,
+                "reject_reason": reject_reason,
+                "file_name": file_name if save_cell else "",
+            }
+        )
+
+    if manifest_path is not None:
+        write_manifest_csv(Path(manifest_path), manifest_records)
+
+    return ExtractionResult(
+        saved_count=saved_count,
+        contour_count=len(contours),
+        detected_cell_count=len(detected_cells),
+        output_cell_count=len(cells),
+        raw_non_empty_count=sum(non_empty_flags),
+        cutoff_index=cutoff_index,
+        blank_rejected_count=blank_rejected_count,
+        after_cutoff_rejected_count=after_cutoff_rejected_count,
+        manifest_records=manifest_records,
+    )
+
+
+def extract_cells_from_image(
+    image_path: Path,
+    output_dir: Path,
+    non_empty_only: bool,
+    min_dark_ratio: float,
+    trim_number_column_ratio: float,
+    cell_top_padding_ratio: float,
+    cell_bottom_padding_ratio: float,
+    save_debug: bool,
+    detection_vertical_margin_ratio: float = DETECTION_VERTICAL_MARGIN_RATIO,
+    detection_horizontal_margin_ratio: float = DETECTION_HORIZONTAL_MARGIN_RATIO,
+    stop_after_first_empty: bool = STOP_AFTER_FIRST_EMPTY,
+    empty_lookahead: int = EMPTY_LOOKAHEAD,
+    manifest_path: Path | None = None,
+) -> int:
+    result = extract_cells_from_image_with_diagnostics(
+        image_path=image_path,
+        output_dir=output_dir,
+        non_empty_only=non_empty_only,
+        min_dark_ratio=min_dark_ratio,
+        trim_number_column_ratio=trim_number_column_ratio,
+        cell_top_padding_ratio=cell_top_padding_ratio,
+        cell_bottom_padding_ratio=cell_bottom_padding_ratio,
+        save_debug=save_debug,
+        detection_vertical_margin_ratio=detection_vertical_margin_ratio,
+        detection_horizontal_margin_ratio=detection_horizontal_margin_ratio,
+        stop_after_first_empty=stop_after_first_empty,
+        empty_lookahead=empty_lookahead,
+        manifest_path=manifest_path,
+    )
+    return result.saved_count
 
 
 def main() -> None:
